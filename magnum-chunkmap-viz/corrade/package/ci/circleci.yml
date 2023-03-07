@@ -1,0 +1,385 @@
+version: 2.1
+
+orbs:
+  codecov: codecov/codecov@1.1.1
+
+executors:
+  ubuntu-16_04:
+    docker:
+    - image: ubuntu:xenial-20201014
+  xcode-10_3:
+    macos:
+      # Since 2021-09-15, images older than 10.3 are dropped by CircleCI. This
+      # means the oldest macOS we can test against is 10.14.4.
+      xcode: 10.3.0
+  xcode-11_5:
+    macos:
+      # xcbeautify (for the iOS build) requires Xcode 11.4. Since 2922-05-23,
+      # 11.4.1 images wait endlessly for "VM assignment", using 11.5 instead.
+      xcode: 11.5
+  emscripten:
+    docker:
+    # 1.39.0 is the oldest on Docker. Anything before 1.39.2 is useless as emar
+    # randomly asserts: https://github.com/emscripten-core/emscripten/pull/9742
+    # Then, anything before 1.39.6 is useless as well because emar has a
+    # filesystem race and randomly complains that a file doesn't exist:
+    # https://github.com/mosra/magnum/issues/413,
+    # https://github.com/emscripten-core/emscripten/pull/10161
+    - image: emscripten/emsdk:1.39.6-upstream
+  python-3_6:
+    docker:
+    - image: python:3.6.12
+  android-29:
+    machine:
+      image: android:202102-01
+  arm64:
+    machine:
+      image: ubuntu-2004:202101-01
+    resource_class: arm.medium
+
+commands:
+  install-base-linux:
+    parameters:
+      extra:
+        type: string
+        default: ""
+    steps:
+    - run:
+        name: Update apt and install base packages
+        command: |
+          apt update
+          if [[ "$CMAKE_CXX_FLAGS" == *"--coverage"* ]]; then export LCOV_PACKAGES="lcov curl"; fi
+          apt install -y ninja-build $LCOV_PACKAGES << parameters.extra >>
+
+  install-base-linux-arm64:
+    parameters:
+      extra:
+        type: string
+        default: ""
+    steps:
+    - run:
+        name: Update apt and install base packages
+        # Compared to Docker images this needs sudo
+        command: |
+          sudo apt update
+          if [[ "$CMAKE_CXX_FLAGS" == *"--coverage"* ]]; then export LCOV_PACKAGES="lcov curl"; fi
+          sudo apt install -y ninja-build gcc cmake $LCOV_PACKAGES << parameters.extra >>
+
+  # ninja needs python@3.9 as a dependency FOR SOME FUCKING REASON and when THE
+  # DAMN THING installs it, it proceeds with reinstalling python@2. FROM
+  # SOURCES! FUCK! and then it fails to link it because NO SHIT, python@3.9 is
+  # already installed! HOW THE FUCK ARE PEOPLE ABLE TO DEAL WITH SUCH CURSED
+  # SHIT ALL THE TIME?! FUCK OFF
+  #
+  # TODO: Needed only on 10.3 and 11.4, not on 11.5 anymore, remove once those
+  #   images are not used anymore.
+  macos-remove-python-curse:
+    steps:
+    - run:
+        name: Remove Python 2 curse
+        command: |
+          HOMEBREW_NO_AUTO_UPDATE=1 brew uninstall python@2
+
+  install-base-macos:
+    parameters:
+      extra:
+        type: string
+        default: ""
+    steps:
+    - run:
+        name: Install base packages
+        # As usual, homebrew takes five minutes to update and then explodes in
+        # a spectacular way. How is this acceptable?!
+        command: |
+          if [[ "$CMAKE_CXX_FLAGS" == *"--coverage"* ]]; then export LCOV_PACKAGES="lcov"; fi
+          HOMEBREW_NO_AUTO_UPDATE=1 brew install cmake ninja $LCOV_PACKAGES << parameters.extra >>
+
+  install-base-android:
+    steps:
+    - run:
+        name: Create Android 29 x86 AVD
+        command: |
+          SYSTEM_IMAGES="system-images;android-29;default;x86"
+          sdkmanager "$SYSTEM_IMAGES"
+          echo "no" | avdmanager --verbose create avd -n test -k "$SYSTEM_IMAGES"
+    - run:
+        name: Launch Android emulator
+        command: |
+          emulator -avd test -delay-adb -verbose -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim
+        background: true
+    - run:
+        name: Update apt and install base packages
+        # Compared to Docker images this needs sudo
+        command: |
+          sudo apt update
+          sudo apt install -y ninja-build
+
+  install-gcc-4_8:
+    steps:
+    - run:
+        name: Install GCC 4.8
+        # For some reason, CMake needs a working C compiler, so provice CC as
+        # well for the case when default gcc isn't installed.
+        command: |
+          apt install -y g++-4.8
+          echo 'export CC=gcc-4.8' >> $BASH_ENV
+          echo 'export CXX=g++-4.8' >> $BASH_ENV
+
+  install-clang-3_8:
+    steps:
+    - run:
+        name: Install Clang 3.8
+        # https://askubuntu.com/questions/787383/how-to-install-llvm-3-9
+        # because the `deb` commands from https://apt.llvm.org don't work
+        #
+        # The software-properties-common need to be installed in order to have
+        # apt-add-repository. Sigh, adding a repository should be a core
+        # feature ffs!
+        #
+        # The apt-transport-https needs to be installed because
+        #  E: The method driver /usr/lib/apt/methods/https could not be found.
+        #  N: Is the package apt-transport-https installed?
+        #
+        # For some reason, CMake needs a working C compiler, so provice CC as
+        # well for the case when default gcc isn't installed.
+        #
+        # The llvm-symbolizer link needs to be set in order to have usable
+        # symbols in the output. This affects suppressions as well, meaning
+        # they won't work if the symbols are not resolvable. It's not enough to
+        # just `export ASAN_SYMBOLIZER_PATH=/usr/bin/llvm-symbolizer-3.8`
+        # because it then complains that
+        #
+        #   External symbolizer path is set to '/usr/bin/llvm-symbolizer-3.8'
+        #   which isn't a known symbolizer. Please set the path to the
+        #   llvm-symbolizer binary or other known tool.
+        #
+        # Probably because because it detects tool type based on the filename?
+        # Ugh.
+        command: |
+          apt install -y software-properties-common apt-transport-https wget
+          wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key | apt-key add -
+          apt-add-repository "deb https://apt.llvm.org/xenial/ llvm-toolchain-xenial-3.9 main"
+          apt update
+          apt install -y clang-3.8
+          echo 'export CC=clang-3.8' >> $BASH_ENV
+          echo 'export CXX=clang++-3.8' >> $BASH_ENV
+          ln -s /usr/bin/llvm-symbolizer{-3.8,}
+
+  install-cmake-3_4:
+    steps:
+    - run:
+        name: Install CMake 3.4
+        command: |
+          apt install -y wget
+          mkdir -p $HOME/cmake && cd $HOME/cmake
+          wget -nc --no-check-certificate https://cmake.org/files/v3.4/cmake-3.4.3-Linux-x86_64.tar.gz
+          tar --strip-components=1 -xzf cmake-3.4.3-Linux-x86_64.tar.gz
+          echo 'export PATH=$HOME/cmake/bin:$PATH' >> $BASH_ENV
+          source $BASH_ENV && cmake --version | grep 3.4
+
+  make-expected-linux-dirs:
+    steps:
+    - run:
+        name: Create files expected by Utility::Path tests on Linux
+        command: |
+          mkdir -p ~/.config/autostart
+          mkdir -p ~/.local
+
+  build:
+    parameters:
+      script:
+        type: string
+    steps:
+    - checkout
+    - run:
+        name: Build & test
+        command: |
+          if [ "$BUILD_STATIC" != "ON" ]; then export BUILD_STATIC=OFF; fi
+          if [ "$BUILD_DEPRECATED" != "OFF" ]; then export BUILD_DEPRECATED=ON; fi
+          ./package/ci/<< parameters.script >>
+
+  lcov:
+    steps:
+    - run:
+        name: Collect code coverage
+        # Keep in sync with PKBUILD-coverage and appveyor-lcov.sh, please
+        command: |
+          lcov $LCOV_EXTRA_OPTS --directory . --capture --output-file coverage.info > /dev/null
+          lcov $LCOV_EXTRA_OPTS --extract coverage.info "*/src/Corrade/*" --output-file coverage.info > /dev/null
+          lcov $LCOV_EXTRA_OPTS --remove coverage.info "*/Test/*" --output-file coverage.info > /dev/null
+          lcov $LCOV_EXTRA_OPTS --remove coverage.info "*/build/src/Corrade/*" --output-file coverage.info > /dev/null
+    - codecov/upload:
+        file: coverage.info
+
+jobs:
+  linux:
+    executor: ubuntu-16_04
+    environment:
+      CMAKE_CXX_FLAGS: --coverage
+      LCOV_EXTRA_OPTS: --gcov-tool /usr/bin/gcov-4.8
+      CONFIGURATION: Debug
+    steps:
+    # Install also Git so we verify that Git version embedding works
+    - install-base-linux:
+        extra: git
+    - install-gcc-4_8
+    - install-cmake-3_4
+    - make-expected-linux-dirs
+    - build:
+        script: unix-desktop.sh
+    - lcov
+
+  linux-arm64:
+    executor: arm64
+    environment:
+      CMAKE_CXX_FLAGS: --coverage
+      CONFIGURATION: Debug
+    steps:
+    # Not installing the old GCC 4.8 and CMake 3.4 to speed up. These are
+    # tested more than enough on other jobs.
+    - install-base-linux-arm64
+    - make-expected-linux-dirs
+    - build:
+        script: unix-desktop.sh
+    - lcov
+
+  linux-static:
+    executor: ubuntu-16_04
+    environment:
+      # STUPID yml interprets unquoted ON as a boolean
+      # https://stackoverflow.com/questions/53648244/specifying-the-string-value-yes-in-a-yaml-property
+      BUILD_STATIC: "ON"
+      CMAKE_CXX_FLAGS: --coverage
+      LCOV_EXTRA_OPTS: --gcov-tool /usr/bin/gcov-4.8
+      CONFIGURATION: Debug
+    steps:
+    - install-base-linux
+    - install-gcc-4_8
+    - install-cmake-3_4
+    - make-expected-linux-dirs
+    - build:
+        script: unix-desktop.sh
+    - lcov
+
+  linux-nondeprecated:
+    executor: ubuntu-16_04
+    environment:
+      # STUPID yml interprets unquoted OFF as a boolean
+      BUILD_DEPRECATED: "OFF"
+      CMAKE_CXX_FLAGS: -DCORRADE_NO_ASSERT
+      CONFIGURATION: Release
+    steps:
+    - install-base-linux
+    - install-gcc-4_8
+    - install-cmake-3_4
+    - make-expected-linux-dirs
+    - build:
+        script: unix-desktop.sh
+
+  linux-sanitizers:
+    executor: ubuntu-16_04
+    environment:
+      CMAKE_CXX_FLAGS: -fsanitize=address
+      CONFIGURATION: Debug
+    steps:
+    - install-base-linux
+    - install-clang-3_8
+    - install-cmake-3_4
+    - make-expected-linux-dirs
+    - build:
+        script: unix-desktop.sh
+
+  linux-threadsanitizer:
+    executor: ubuntu-16_04
+    environment:
+      CMAKE_CXX_FLAGS: -fsanitize=thread
+      CONFIGURATION: Debug
+    steps:
+    - install-base-linux
+    - install-clang-3_8
+    - install-cmake-3_4
+    - make-expected-linux-dirs
+    - build:
+        script: unix-desktop.sh
+
+  macos:
+    executor: xcode-10_3
+    environment:
+      CMAKE_CXX_FLAGS: --coverage
+      CONFIGURATION: Debug
+    steps:
+    - macos-remove-python-curse
+    - install-base-macos
+    - build:
+        script: unix-desktop.sh
+    - lcov
+
+  macos-static:
+    executor: xcode-10_3
+    environment:
+      # STUPID yml interprets unquoted ON as a boolean
+      BUILD_STATIC: "ON"
+      CMAKE_CXX_FLAGS: --coverage
+      CONFIGURATION: Debug
+    steps:
+    - macos-remove-python-curse
+    - install-base-macos
+    - build:
+        script: unix-desktop.sh
+    - lcov
+
+  emscripten:
+    executor: emscripten
+    steps:
+    - install-base-linux
+    - build:
+        script: emscripten.sh
+
+  android-x86:
+    executor: android-29
+    steps:
+    - install-base-android
+    - build:
+        script: android-x86.sh
+
+  ios:
+    executor: xcode-11_5
+    steps:
+    - install-base-macos:
+        extra: xcbeautify
+    - build:
+        script: ios-simulator.sh
+
+  # Python preprocessor for magnum-singles, for a lack of better name
+  acme:
+    executor: python-3_6
+    steps:
+    - run:
+        name: Install coverage and codecov
+        command: pip install coverage codecov
+    - checkout
+    - run:
+        name: Run tests and collect coverage
+        working_directory: src/acme
+        command: coverage run -m unittest
+    - run:
+        name: Upload coverage
+        working_directory: src/acme
+        command: codecov
+
+workflows:
+  version: 2
+  build:
+    jobs:
+    - linux
+    - linux-arm64
+    - linux-static
+    - linux-nondeprecated
+    - linux-sanitizers
+    - linux-threadsanitizer
+    - macos
+    - macos-static
+    - emscripten
+    - android-x86
+    - ios
+    - acme

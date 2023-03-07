@@ -1,0 +1,210 @@
+#ifndef _CHUNK_MAP_CHUNK_MAP_H_
+#define _CHUNK_MAP_CHUNK_MAP_H_
+
+#include <memory>
+#include <map>
+#include <any>
+#include <variant>
+#include <array>
+#include <Eigen/Eigen>
+#include <opencv2/opencv.hpp>
+#include "aztools/mat.hpp"
+#include "LidarIris/LidarIris.h"
+
+struct ChunkData;
+
+namespace ObstacleFeature
+{
+
+    // enum of obstacle sgements
+    enum Segments
+    {
+        Seg8 = 8,
+        Seg32 = 32
+    };
+
+    // enum of bits per segment
+    enum Bits
+    {
+        Default = 0, // used by old format
+        Bit1 = 1,
+        Bit4 = 4
+    };
+
+    // pre enum possible obstacle arguments, used by template functions
+    using ObstacleDescIndex = std::pair<ObstacleFeature::Segments, ObstacleFeature::Bits>;
+    constexpr auto ObstacleDescList = std::array{
+        ObstacleDescIndex{ObstacleFeature::Seg8, ObstacleFeature::Default},
+        ObstacleDescIndex{ObstacleFeature::Seg8, ObstacleFeature::Bit1},
+        ObstacleDescIndex{ObstacleFeature::Seg8, ObstacleFeature::Bit4},
+        ObstacleDescIndex{ObstacleFeature::Seg32, ObstacleFeature::Default},
+        ObstacleDescIndex{ObstacleFeature::Seg32, ObstacleFeature::Bit1},
+        ObstacleDescIndex{ObstacleFeature::Seg32, ObstacleFeature::Bit4},
+    };
+    constexpr int ObstacleDescListLength = ObstacleDescList.size();
+}
+
+// chunkmap itself, chunkmap means 'chunk' map, the 'chunk' is like the 'chunk' concept in minecraft.
+class ChunkMap
+{
+public:
+
+    // index of 'chunk'
+    struct Index
+    {
+        int64_t x;
+        int64_t y;
+        bool operator<(const Index &b) const
+        {
+            return (x < b.x) || (x == b.x && y < b.y);
+        }
+    };
+
+    // index of cell
+    struct CellIndex
+    {
+        Index chunk;
+        size_t layer;
+        cv::Point cell;
+        bool operator==(const CellIndex &v) const { return (chunk.x == v.chunk.x) && (chunk.y == v.chunk.y) && layer == v.layer && (cell == v.cell); }
+    };
+
+    // config of chunkmap
+    struct Config
+    {
+        float resolution; // resoution of cell
+        float chunk_base; // edge length of each chunk
+    };
+
+    // compress iris descriptor
+    struct CompressedDesc
+    {
+        std::vector<uint8_t> img;
+        std::vector<uint8_t> T;
+        std::vector<uint8_t> M;
+    };
+
+    // enum of key-frame iris descriptor is compress
+    enum class DescType
+    {
+        uncompressed,
+        compressed
+    };
+
+    // obstacle desc
+    template <ObstacleFeature::Segments S, ObstacleFeature::Bits B>
+    struct ObstacleTypeDesc
+    {
+        using ElemType = aztools::bitsmat::bitset<S * B, uint8_t>;
+        using Type = aztools::bitsmat::Mat_<ElemType>;
+        static constexpr size_t serial_id = uint32_t(B) << 16 | uint16_t(S); // obtacle type
+        static constexpr size_t max_height = ElemType::MAX_BITS;
+        static constexpr auto wrapper = aztools::bitsmat::wrap<ElemType>{};
+    };
+
+    // key-frame iris descriptor that allow compress save
+    struct KeyFrameData
+    {
+        std::variant<LidarIris::FeatureDesc, CompressedDesc> feature;
+        Eigen::Matrix4f pose;
+    };
+
+    using Ptr = std::shared_ptr<ChunkMap>;
+    ChunkMap(const Config &config);
+
+    // void dirty(const Index &index) { dirty_set.insert(index); }
+    // std::set<Index> update() { return std::move(dirty_set); }
+    
+    virtual ~ChunkMap() {}
+    ChunkData &operator[](const Index &index);
+    const ChunkData &at(const Index &index) const;
+    std::vector<Index> keys() const;
+
+    // query point from 3d-index to cell index
+    bool query(const Eigen::Vector3f &point, CellIndex &index, float *error = nullptr) const;
+    // query point from cell index to 3d-index
+    bool query(const CellIndex &index, Eigen::Vector3f &point) const;
+
+    static void load(std::istream &stream, const ChunkMap::Ptr &map);
+    static void save(std::ostream &stream, const ChunkMap::Ptr &map);
+
+    std::vector<KeyFrameData> key_frames;
+    DescType desc_type = DescType::uncompressed;
+    // ObstacleBits obstacle_bits = ObstacleBits::Bit32;
+    ObstacleFeature::Segments obstacle_segments = ObstacleFeature::Seg32;
+    ObstacleFeature::Bits obstacle_bits = ObstacleFeature::Bit1;
+
+    pcl::PointCloud<pcl::PointXYZ>::Ptr generateObstacleCloud();
+    pcl::PointCloud<pcl::PointXYZI>::Ptr generateObstacleCloudProb();
+    std::pair<int, int> ObstacleCount();
+
+    float resolution() const { return config_.resolution; }
+    float chunkBase() const { return config_.chunk_base; }
+    uint32_t chunkSize() const { return chunk_size; }
+
+protected:
+    Config config_;
+    std::map<Index, ChunkData> chunks;
+    uint32_t chunk_size;
+
+    // std::set<Index> dirty_set;
+};
+
+template <ObstacleFeature::Segments S>
+struct ChunkMap::ObstacleTypeDesc<S, ObstacleFeature::Default>
+{
+    using ElemType = aztools::bitsmat::bitset<S, uint8_t>;
+    using Type = aztools::bitsmat::Mat_<ElemType>;
+    static constexpr size_t serial_id = uint16_t(S);
+    static constexpr size_t max_height = ElemType::MAX_BITS;
+    static constexpr auto wrapper = aztools::bitsmat::wrap<ElemType>{};
+};
+
+size_t ObstacleTypeDesc_serial_id(const ObstacleFeature::Segments &seg, const ObstacleFeature::Bits &bit);
+size_t ObstacleTypeDesc_max_height(const ObstacleFeature::Segments &seg, const ObstacleFeature::Bits &bit);
+cv::Mat ObstacleTypeDesc_create(const ObstacleFeature::Segments &seg, const ObstacleFeature::Bits &bit, const cv::Size &size);
+
+uint64_t ObstacleTypeDesc_at(const ObstacleFeature::Segments &seg, const ObstacleFeature::Bits &bit, const cv::Mat &mat, int r, int c);
+
+// layer in chunk
+struct ChunkLayer
+{
+    cv::Mat1b observe;
+    cv::Mat1f occupancy;
+    cv::Mat1f elevation;
+    cv::Mat1f elevation_sigma;
+    // cv::Mat_<int32_t> obstacle_info;
+    cv::Mat obstacle_info;
+    // cv::Mat3b image;
+    // cv::Mat1b image_observe;
+    // cv::Mat1f image_sigma;
+};
+
+// the 'chunk' stuct
+class ChunkData
+{
+public:
+    void init(const ChunkMap::Index &index, ChunkMap *map, uint32_t chunk_size);
+
+    // void dirty() { map_->dirty(index_); }
+
+    ChunkLayer createLayer() const;
+
+    const std::vector<ChunkLayer> &getLayers() const { return layers_; }
+
+    void setLayers(std::vector<ChunkLayer> &layers)
+    {
+        layers_.swap(layers);
+        // map_->dirty(index_);
+    }
+
+    std::any meta;
+
+private:
+    ChunkMap *map_;
+    ChunkMap::Index index_;
+    uint32_t chunk_size_;
+    std::vector<ChunkLayer> layers_;
+};
+
+#endif // _CHUNK_MAP_CHUNK_MAP_H_

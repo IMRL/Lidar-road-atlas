@@ -1,0 +1,12 @@
+<launch>
+    <arg name="save_path" default="" />
+    <!-- <param name="/use_sim_time" value="true" /> -->
+    <node pkg="LidarAtlas" type="LidarAtlas_node" name="lidar_atlas" output="screen">
+        <param name="save_path" value="$(arg save_path)" />
+        <param name="indexed_points_topic" value="/points_indexed" />
+        <param name="poses_topic" value="/global_poses" />
+        <!-- <param name="hit_probability" value="0.32" /> -->
+        <!-- <param name="miss_probability" value="0.55" /> -->
+    </node>
+    <node pkg="rviz" type="rviz" name="rviz" output="screen" />
+</launch>
