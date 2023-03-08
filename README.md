@@ -1,4 +1,10 @@
-# Road-Atlas 相关代码
+This code is an implementation of our work "Lidar Road-Atlas: An Efficient Map Representation for General 3d Urban Environment", published at Journal of Field Robotics, 2023.
+[Reference]: Banghe Wu, Chengzhong Xu, and Hui Kong, Lidar Road-Atlas: An Efficient Map Representation for General 3d Urban Environment, Journal of Field Robotics, 2023
+
+
+----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+## Road-Atlas 相关代码
 
 - RoadAtlas-ros: 建图程序本体，ROS版本
     - chunkmap: 基础地图表示库
